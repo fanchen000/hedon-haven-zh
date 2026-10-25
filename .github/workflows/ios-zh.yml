@@ -15,7 +15,8 @@ permissions:
 
 jobs:
   ios-zh:
-    runs-on: macos-15
+    # device_info_plus 13.2.0 requires the iOS 26 SDK (NSProcessInfo.isiOSAppOnVision).
+    runs-on: macos-26
     timeout-minutes: 70
     steps:
       - name: Checkout
