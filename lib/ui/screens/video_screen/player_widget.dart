@@ -1,0 +1,739 @@
+import 'dart:async';
+import 'dart:typed_data';
+
+import 'package:audio_video_progress_bar/audio_video_progress_bar.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:video_player/video_player.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
+
+import '/services/bug_report_manager.dart';
+import '/ui/screens/bug_report/bug_reports_list.dart';
+import '/utils/exceptions.dart';
+import '/utils/global_vars.dart';
+import '/utils/universal_formats.dart';
+
+class VideoPlayerWidget extends StatefulWidget {
+  UniversalVideoMetadata videoMetadata;
+  List<Uint8List>? progressThumbnails;
+  bool isFullScreen;
+  final Function() toggleFullScreen;
+
+  VideoPlayerWidget(
+      {super.key,
+      required this.videoMetadata,
+      required this.progressThumbnails,
+      required this.isFullScreen,
+      required this.toggleFullScreen});
+
+  @override
+  State<VideoPlayerWidget> createState() => VideoPlayerWidgetState();
+}
+
+class VideoPlayerWidgetState extends State<VideoPlayerWidget> {
+  int skipBy = 5;
+  Timer? hideControlsTimer;
+  bool showControls = false;
+  bool hidePlayControls = false;
+  bool firstPlay = true;
+  bool showProgressThumbnail = false;
+  bool enableProgressThumbnails = false;
+  int selectedResolution = 0;
+  List<int> sortedResolutions = [];
+  VideoPlayerController controller =
+      VideoPlayerController.networkUrl(Uri.parse(""));
+  Future<void>? controllerInitFuture;
+  Uint8List timelineProgressThumbnail = Uint8List(0);
+  Uint8List emptyImage = Uint8List(0);
+  double progressThumbnailPosition = 0.0;
+  Exception? videoPlayerException;
+  double dragOffsetY = 0.0;
+
+  Offset _doubleTapPosition = Offset.zero;
+  int _leftTapCount = 0;
+  int _rightTapCount = 0;
+  bool _showLeftRipple = false;
+  bool _showRightRipple = false;
+  Timer? _leftRippleTimer;
+  Timer? _rightRippleTimer;
+
+  double _videoWidth = 0.0;
+
+  @override
+  void initState() {
+    super.initState();
+
+    sharedStorage.getBool("media_show_progress_thumbnails").then((value) {
+      enableProgressThumbnails = value!;
+    });
+
+    sharedStorage.getInt("media_seek_duration").then((value) {
+      skipBy = value!;
+    });
+
+    initVideoPlayer();
+  }
+
+  void initVideoPlayer() async {
+    // read preferred video quality setting
+    int preferredQuality =
+        (await sharedStorage.getInt("media_preferred_video_quality"))!;
+    selectedResolution = preferredQuality;
+
+    if (widget.videoMetadata.virtualReality) {
+      setState(
+          () => videoPlayerException = VirtualRealityNotSupportedException());
+    }
+
+    if (widget.videoMetadata.m3u8Uris.length > 1) {
+      // select the preferred quality, or the closest to it
+
+      // Sort the available resolutions in ascending order
+      sortedResolutions = widget.videoMetadata.m3u8Uris.keys.toList()..sort();
+
+      // If the user's choice is not in the list, find the next highest resolution
+      if (!sortedResolutions.contains(preferredQuality)) {
+        int nextHighest = preferredQuality;
+        for (int i = 0; i < sortedResolutions.length - 1; i++) {
+          if (sortedResolutions[i] < preferredQuality) {
+            nextHighest = sortedResolutions[i + 1];
+          }
+        }
+        selectedResolution = nextHighest;
+      }
+    } else {
+      selectedResolution = sortedResolutions[0];
+    }
+    // Check if m3u8 links exist and display toast message
+    if (widget.videoMetadata.m3u8Uris[selectedResolution] == null) {
+      setState(() => videoPlayerException =
+          Exception("Couldn't play video: M3U8 url not found"));
+    }
+    initVideoController(widget.videoMetadata.m3u8Uris[selectedResolution]!);
+  }
+
+  @override
+  void dispose() {
+    // wait for pending initialization before disposing, to avoid
+    // "Cannot add event after closing" errors from fvp's native callbacks
+    controllerInitFuture?.whenComplete(controller.dispose) ??
+        controller.dispose();
+    hideControlsTimer?.cancel();
+    _leftRippleTimer?.cancel();
+    _rightRippleTimer?.cancel();
+    super.dispose();
+  }
+
+  void initVideoController(Uri url) {
+    final bool isPlaying = controller.value.isPlaying;
+    final oldPosition = controller.value.position;
+    logger.d("Old position: $oldPosition");
+
+    // dispose controller once its init finishes, to avoid
+    // "Cannot add event after closing" errors from fvp
+    final oldController = controller;
+    final oldInitFuture = controllerInitFuture;
+    oldInitFuture?.whenComplete(oldController.dispose) ??
+        oldController.dispose();
+
+    logger.i("Setting new url: $url");
+    controller = VideoPlayerController.networkUrl(url,
+        httpHeaders: widget.videoMetadata.playbackHttpHeaders ?? {});
+    controllerInitFuture = controller.initialize().then((value) async {
+      setState(() {});
+      await controller.seekTo(oldPosition);
+      if (firstPlay) {
+        firstPlay = false;
+        logger.d("Video controller prepping for first play");
+
+        if ((await sharedStorage.getBool("media_start_in_fullscreen"))!) {
+          logger.i(
+              "Full-screening video as per settings (if not already in full-screen)");
+          if (!widget.isFullScreen) widget.toggleFullScreen.call();
+          // Schedule a setState after the toggleFullScreen call to ensure
+          // the loading spinner goes away
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) setState(() {});
+          });
+        }
+
+        if ((await sharedStorage.getBool("media_auto_play"))!) {
+          logger.i("Auto-starting video as per settings");
+          await controller.play();
+          hideControlsOverlay();
+          return; // return, so that controls arent automatically shown
+        }
+
+        // only show controls after controller is fully done initializing
+        showControls = true;
+      }
+
+      if (isPlaying) {
+        logger.i("Resuming video");
+        await controller.play();
+      }
+
+      setState(() {});
+    });
+
+    // video_player sometimes just silently fails to init
+    // -> add a timeout that will show an error to the user if the video fails to init in 15 seconds
+    Timer? errorTimeout;
+    errorTimeout ??= Timer(const Duration(seconds: 10), () {
+      if (!controller.value.isInitialized &&
+          !controller.value.isBuffering &&
+          controller.value.position == Duration.zero) {
+        logger.e("Video player initialization timed out");
+        setState(() => videoPlayerException =
+            Exception("Video player failed to initialize due to: "
+                "${controller.value.errorDescription ?? "Timeout error"}"));
+      }
+    });
+
+    controller.addListener(() {
+      final playerState = controller.value;
+
+      if (playerState.hasError && !playerState.isCompleted) {
+        errorTimeout?.cancel();
+        logger.e("Video playback error: ${playerState.errorDescription}");
+        setState(() => videoPlayerException =
+            Exception("Video player encountered error during playback: "
+                "${playerState.errorDescription ?? "未知播放错误"}"));
+        return;
+      }
+
+      // Cancel timeout if video starts playing or initializes
+      if (playerState.position > Duration.zero || playerState.isInitialized) {
+        errorTimeout?.cancel();
+      }
+    });
+
+    controller.position.asStream().listen((_) {
+      // rebuild tree when video position changes
+      // make sure tree is still mounted
+      if (mounted) setState(() {});
+    });
+  }
+
+  void hideControlsOverlay() {
+    hideControlsTimer?.cancel(); // stop any old timers
+    hideControlsTimer = Timer(const Duration(seconds: 3), () {
+      logger.d("Timer is completed");
+      if (showProgressThumbnail) {
+        // don't hide controls while progress thumbnail is shown
+        logger.d("Progress thumbnail shown, not hiding controls");
+        return;
+      }
+      setState(() {
+        showControls = false;
+      });
+    });
+  }
+
+  void showControlsOverlay() {
+    logger.d("Show controls triggered");
+    if (firstPlay) {
+      // refuse to show controls while video is initializing the first time
+      return;
+    }
+    if (!(hideControlsTimer?.isActive ?? true) && controller.value.isPlaying) {
+      logger.d("Timer not running, starting it");
+      hideControlsOverlay();
+    } else {
+      logger.d("Timer is running, stopping it");
+      hideControlsTimer?.cancel();
+    }
+    setState(() {
+      showControls = !showControls;
+      logger.d("showControls set to: $showControls");
+    });
+  }
+
+  void playPausePlayer() async {
+    if (controller.value.isPlaying) {
+      controller.pause();
+      WakelockPlus.disable();
+      hideControlsTimer?.cancel();
+    } else {
+      controller.play();
+      WakelockPlus.enable();
+      hideControlsOverlay();
+    }
+    setState(() {});
+  }
+
+  void pausePlayer() async {
+    if (controller.value.isPlaying) {
+      controller.pause();
+      WakelockPlus.disable();
+      hideControlsTimer?.cancel();
+    }
+    setState(() {});
+  }
+
+  void updateProgressThumbnailPosition(ThumbDragDetails position) {
+    if (widget.progressThumbnails?.isNotEmpty ?? false) {
+      timelineProgressThumbnail =
+          widget.progressThumbnails![position.timeStamp.inSeconds];
+    }
+
+    double screenWidth = MediaQuery.of(context).size.width;
+    // make sure the progress image stays within the screen bounds -20px
+    // but still moves with the thumb cursor when it can
+    if (position.globalPosition.dx > 100) {
+      if (position.globalPosition.dx > screenWidth - 100) {
+        progressThumbnailPosition = screenWidth - 180;
+      } else {
+        progressThumbnailPosition = position.globalPosition.dx - 80;
+      }
+    } else {
+      progressThumbnailPosition = 20;
+    }
+
+    // FIXME: ProgressThumbnails flicker when loaded the first time from memory
+    // FIXME: Invalid image data when loading a real progress thumbnail for the first time
+    setState(() {});
+  }
+
+  void handleDoubleTap(double videoWidth) {
+    if (!controller.value.isInitialized) return;
+    final dx = _doubleTapPosition.dx;
+    final isLeft = dx < videoWidth / 2;
+
+    // Do not trigger in the middle-ish of the screen
+    if (dx >= videoWidth * 3 / 8 && dx <= videoWidth * 5 / 8) return;
+
+    // Stop opposite ripple if active
+    if (isLeft) {
+      _rightRippleTimer?.cancel();
+      setState(() => _showRightRipple = false);
+    } else {
+      _leftRippleTimer?.cancel();
+      setState(() => _showLeftRipple = false);
+    }
+
+    // Skip to new time
+    final newTime = controller.value.position +
+        Duration(seconds: isLeft ? -skipBy : skipBy);
+    controller.seekTo(newTime.isNegative ? Duration.zero : newTime);
+
+    // Display ripple to user
+    if (isLeft) {
+      _leftRippleTimer?.cancel();
+      setState(() {
+        // Reset tap count if ripple is not being displayed already
+        // account for the tap that triggered the new ripple
+        _leftTapCount = !_showLeftRipple ? 1 : _leftTapCount + 1;
+        _showLeftRipple = true;
+      });
+      _leftRippleTimer = Timer(const Duration(milliseconds: 800), () {
+        if (mounted) setState(() => _showLeftRipple = false);
+      });
+    } else {
+      _rightRippleTimer?.cancel();
+      setState(() {
+        // Reset tap count if ripple is not being displayed already
+        // account for the tap that triggered the new ripple
+        _rightTapCount = !_showRightRipple ? 1 : _rightTapCount + 1;
+        _showRightRipple = true;
+      });
+      _rightRippleTimer = Timer(const Duration(milliseconds: 800), () {
+        if (mounted) setState(() => _showRightRipple = false);
+      });
+    }
+  }
+
+  void createPlayerBugReport() {
+    // Pop immediately to avoid another bug report
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        settings: RouteSettings(name: "/bug-reports-list-scraping-mode"),
+        builder: (context) => BugReportsListScreen(
+          scrapingReportMode: true,
+          bugReportsList: [
+            PluginBugReport(
+              navigatorPath: navigatorPathObserver.currentPath,
+              exception: videoPlayerException!,
+              pluginCodeName: widget.videoMetadata.plugin!.codeName,
+              isBundledPlugin: widget.videoMetadata.plugin!.isBundledPlugin,
+              debugObject: widget.videoMetadata.toMap(),
+            )
+          ],
+        ),
+      ),
+    ).then((value) => Navigator.of(context).pop());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final double maxDrag = MediaQuery.of(context).size.width * 9 / 16 * 0.4;
+    final bool isMobile = MediaQuery.of(context).size.width < 1100;
+    return PopScope(
+        onPopInvoked: (goingToPop) {
+          // immediately stop video if popping
+          if (goingToPop) {
+            logger.d("Stopping video on pop");
+            controller.pause();
+          }
+        },
+        child: GestureDetector(
+            // pass taps to elements below
+            behavior: HitTestBehavior.translucent,
+            onTap: showControlsOverlay,
+            onDoubleTapDown: (details) =>
+                _doubleTapPosition = details.localPosition,
+            onDoubleTap: () => handleDoubleTap(_videoWidth),
+            onVerticalDragUpdate: !isMobile
+                ? null
+                : (details) {
+                    setState(() {
+                      dragOffsetY = (dragOffsetY + details.delta.dy).clamp(
+                        widget.isFullScreen ? 0.0 : -maxDrag,
+                        widget.isFullScreen ? maxDrag : 0.0,
+                      );
+                    });
+                  },
+            onVerticalDragEnd: !isMobile
+                ? null
+                : (details) {
+                    final triggered = dragOffsetY.abs() >= maxDrag;
+                    setState(() => dragOffsetY = 0.0);
+                    if (triggered) widget.toggleFullScreen.call();
+                  },
+            child: Stack(children: [
+              ClipRect(
+                  child: Transform.scale(
+                      scale: widget.isFullScreen
+                          ? 1.0 - (dragOffsetY.abs() / maxDrag) * 0.2
+                          : 1.0 + (dragOffsetY.abs() / maxDrag) * 0.2,
+                      alignment: Alignment.bottomCenter,
+                      child: LayoutBuilder(builder: (context, constraints) {
+                        _videoWidth = constraints.maxWidth;
+                        return Container(
+                            color: Colors.black,
+                            child: SizedBox(
+                                height: MediaQuery.of(context).orientation ==
+                                        Orientation.landscape
+                                    ? MediaQuery.of(context).size.height
+                                    : constraints.maxWidth * 9 / 16,
+                                child: videoPlayerException != null
+                                    ? buildErrorScreen()
+                                    : Stack(
+                                        alignment: Alignment.center,
+                                        children: <Widget>[
+                                          controller.value.isInitialized
+                                              // This makes the video 16:9 while loading -> skeleton looks weird otherwise
+                                              ? AspectRatio(
+                                                  aspectRatio: controller
+                                                          .value.isInitialized
+                                                      ? controller
+                                                          .value.aspectRatio
+                                                      : 16 / 9,
+                                                  child:
+                                                      VideoPlayer(controller))
+                                              : const CircularProgressIndicator(
+                                                  color: Colors.white),
+                                          // gray background to make buttons more visible when overlay is on
+                                          OverlayWidget(
+                                            showControls: showControls,
+                                            child: Container(
+                                              width: double.infinity,
+                                              height: double.infinity,
+                                              color: Colors.black
+                                                  .withValues(alpha: 0.5),
+                                            ),
+                                          ),
+                                          buildSkipWidget(constraints.maxWidth,
+                                              constraints.maxHeight),
+                                          OverlayWidget(
+                                            showControls: showControls &&
+                                                !hidePlayControls,
+                                            child: controller.value.isBuffering
+                                                ? const CircularProgressIndicator(
+                                                    color: Colors.white,
+                                                  )
+                                                : CircleAvatar(
+                                                    radius: 28,
+                                                    backgroundColor: Colors
+                                                        .black
+                                                        .withValues(alpha: 0.2),
+                                                    child: IconButton(
+                                                      splashColor:
+                                                          Colors.transparent,
+                                                      icon: Icon(
+                                                        controller
+                                                                .value.isPlaying
+                                                            ? Icons.pause
+                                                            : Icons.play_arrow,
+                                                        size: 40.0,
+                                                        color: Colors.white,
+                                                      ),
+                                                      color: Colors.white,
+                                                      onPressed:
+                                                          playPausePlayer,
+                                                    ),
+                                                  ),
+                                          ),
+                                          Positioned(
+                                              left: progressThumbnailPosition,
+                                              bottom: 50,
+                                              // TODO: Set size limits
+                                              child: OverlayWidget(
+                                                  showControls: showControls,
+                                                  child: showProgressThumbnail
+                                                      ? widget.progressThumbnails !=
+                                                              null
+                                                          ? Image.memory(
+                                                              timelineProgressThumbnail,
+                                                              width: 160,
+                                                              height: 90)
+                                                          : Container(
+                                                              color:
+                                                                  Colors.black,
+                                                              width: 160,
+                                                              height: 90,
+                                                              child: const Center(
+                                                                  child: CircularProgressIndicator(
+                                                                      color: Colors
+                                                                          .white)))
+                                                      : const SizedBox())),
+                                          Positioned(
+                                              top: 5,
+                                              right: 10,
+                                              child: buildQualityDropdown()),
+                                          Positioned(
+                                            bottom: 5.0,
+                                            left: 20.0,
+                                            right: 0.0,
+                                            child: Row(
+                                                mainAxisAlignment:
+                                                    MainAxisAlignment.start,
+                                                crossAxisAlignment:
+                                                    CrossAxisAlignment.center,
+                                                children: <Widget>[
+                                                  Expanded(
+                                                    child: buildProgressBar(),
+                                                  ),
+                                                  OverlayWidget(
+                                                      showControls:
+                                                          showControls,
+                                                      child: IconButton(
+                                                        icon: Icon(
+                                                          widget.isFullScreen
+                                                              ? Icons
+                                                                  .fullscreen_exit
+                                                              : Icons
+                                                                  .fullscreen,
+                                                          color: Colors.white,
+                                                          size: 30.0,
+                                                        ),
+                                                        onPressed: widget
+                                                            .toggleFullScreen
+                                                            .call,
+                                                      )),
+                                                ]),
+                                          ),
+                                        ],
+                                      )));
+                      }))),
+              // overlay back button unless actively playing video
+              if (!controller.value.isInitialized ||
+                  showControls ||
+                  videoPlayerException != null)
+                Positioned(
+                    top: 0, left: 0, child: BackButton(color: Colors.white)),
+            ])));
+  }
+
+  Widget buildErrorScreen() {
+    return Center(
+        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+      Text("播放器错误",
+          style: const TextStyle(fontSize: 20), textAlign: TextAlign.center),
+      SizedBox(height: 10),
+      ElevatedButton(
+          style: TextButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.primary),
+          child: Text("创建错误报告",
+              style: Theme.of(context)
+                  .textTheme
+                  .titleMedium
+                  ?.copyWith(color: Theme.of(context).colorScheme.onPrimary)),
+          onPressed: () => createPlayerBugReport())
+    ]));
+  }
+
+  Widget buildQualityDropdown() {
+    return OverlayWidget(
+        showControls: showControls,
+        // TODO: Force animation to always go downwards
+        child: DropdownButton<String>(
+          style: const TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.bold,
+            fontSize: 16,
+          ),
+          dropdownColor: Colors.black87,
+          padding: const EdgeInsets.all(0.0),
+          value: "${selectedResolution}p",
+          underline: const SizedBox(),
+          onChanged: (String? newValue) async {
+            selectedResolution =
+                int.parse(newValue!.substring(0, newValue.length - 1));
+            initVideoController(
+                widget.videoMetadata.m3u8Uris[selectedResolution]!);
+          },
+          items: sortedResolutions.map<DropdownMenuItem<String>>((int value) {
+            return DropdownMenuItem<String>(
+              value: "${value}p",
+              child: Text("${value}p",
+                  style: const TextStyle(color: Colors.white)),
+            );
+          }).toList(),
+        ));
+  }
+
+  Widget buildProgressBar() {
+    return OverlayWidget(
+        showControls: showControls,
+        child: ProgressBar(
+            // The following drag functions are called after the user starts/stops/drags and the screen is updated
+            // Therefore anything that is done in these functions wont have an immediate effect, unless something else also updates
+            // Use setState to force an update
+            onDragStart: !enableProgressThumbnails
+                ? null
+                : (position) {
+                    // if the list is empty (i.e. the getProgressThumbnails function
+                    // failed or the provider has no thumbnails), don't show the loading thumbnail
+                    if (widget.progressThumbnails?.isNotEmpty ?? true) {
+                      logger.d("Drag start, showing progress thumbnail");
+                      updateProgressThumbnailPosition(position);
+                      setState(() {
+                        hidePlayControls = true;
+                        showProgressThumbnail = true;
+                      });
+                    } else {
+                      logger.d(
+                          "Drag start, not showing progress thumbnail because list is empty");
+                    }
+                  },
+            onDragUpdate: !enableProgressThumbnails
+                ? null
+                : (position) => updateProgressThumbnailPosition(position),
+            // This function is called when the user lets go
+            onDragEnd: !enableProgressThumbnails
+                ? null
+                : () {
+                    logger.d("Drag end, hiding progress image");
+                    setState(() {
+                      hidePlayControls = false;
+                      showProgressThumbnail = false;
+                    });
+                    // start hiding the overlay
+                    hideControlsOverlay();
+                  },
+            // TODO: Possibly make TimeLabels in Youtube style
+            timeLabelLocation: TimeLabelLocation.sides,
+            timeLabelTextStyle:
+                const TextStyle(color: Colors.white, fontSize: 16),
+            thumbGlowRadius: 0.0,
+            // TODO: Find a way to increase the hitbox without increasing the thumb radius
+            thumbRadius: 6.0,
+            barCapShape: BarCapShape.square,
+            barHeight: 2.0,
+            // set baseBarColor to white, with low opacity
+            baseBarColor: Colors.white.withValues(alpha: 0.2),
+            progressBarColor: Theme.of(context).colorScheme.primary,
+            bufferedBarColor: Colors.grey.withValues(alpha: 0.5),
+            thumbColor: Theme.of(context).colorScheme.primary,
+            progress: controller.value.position,
+            buffered: controller.value.isInitialized
+                ? controller.value.buffered.firstOrNull?.end
+                : null,
+            total: controller.value.isInitialized
+                ? controller.value.duration
+                : Duration.zero,
+            onSeek: (duration) => controller.seekTo(duration)));
+  }
+
+  Widget buildSkipWidget(double videoWidth, double videoHeight) {
+    final halfWidth = videoWidth / 2;
+
+    // Align relative to full video dimensions
+    final tapAlign = Alignment(
+      (_doubleTapPosition.dx / videoWidth) * 2 - 1,
+      (_doubleTapPosition.dy / videoHeight).clamp(0.0, 1.0) * 2 - 1,
+    );
+
+    Widget ripple(bool isLeft) => Positioned.fill(
+          child: AnimatedOpacity(
+            opacity: (isLeft ? _showLeftRipple : _showRightRipple) ? 1 : 0,
+            duration: const Duration(milliseconds: 200),
+            child: Stack(children: [
+              // Full-width gradient — fades to transparent, no hard cut
+              Positioned.fill(
+                child: Container(
+                  decoration: BoxDecoration(
+                    gradient: RadialGradient(
+                      center: tapAlign,
+                      radius: 0.6,
+                      colors: [Colors.white60, Colors.transparent],
+                    ),
+                  ),
+                ),
+              ),
+              // Icon anchored to its half
+              Positioned(
+                left: isLeft ? 0 : halfWidth,
+                right: isLeft ? halfWidth : 0,
+                top: 0,
+                bottom: 0,
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(isLeft ? Icons.fast_rewind : Icons.fast_forward,
+                        color: Colors.white, size: 46),
+                    Text(
+                        "${isLeft ? '-' : '+'}${skipBy * (isLeft ? _leftTapCount : _rightTapCount)}s",
+                        style: Theme.of(context).textTheme.titleLarge!.copyWith(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                          shadows: [
+                            Shadow(blurRadius: 4, color: Colors.black54)
+                          ],
+                        )),
+                  ],
+                ),
+              ),
+            ]),
+          ),
+        );
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [ripple(true), ripple(false)],
+    );
+  }
+}
+
+class OverlayWidget extends StatelessWidget {
+  final Widget child;
+  bool showControls;
+
+  OverlayWidget({
+    super.key,
+    required this.child,
+    required this.showControls,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+        // TODO: Wait for animation to finish before ignoring touch input
+        ignoring: !showControls,
+        child: AnimatedOpacity(
+            opacity: showControls ? 1.0 : 0.0,
+            duration: const Duration(milliseconds: 220),
+            child: child));
+  }
+}

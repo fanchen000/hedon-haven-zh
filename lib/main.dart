@@ -1,0 +1,596 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:ui';
+
+import 'package:dynamic_color/dynamic_color.dart';
+import 'package:flutter/services.dart';
+import 'package:fvp/fvp.dart' as fvp;
+import 'package:material_ui/material_ui.dart';
+import 'package:receive_sharing_intent/receive_sharing_intent.dart';
+import 'package:rhttp/rhttp.dart';
+import 'package:secure_app_switcher/secure_app_switcher.dart';
+import 'package:super_drag_and_drop/super_drag_and_drop.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+import '/services/analytics_manager.dart';
+import '/services/bug_report_manager.dart';
+import '/services/database_manager.dart';
+import '/services/external_link_manager.dart';
+import '/services/icon_manager.dart';
+import '/services/plugin_manager.dart';
+import '/services/shared_prefs_manager.dart';
+import '/services/update_manager.dart';
+import '/ui/screens/bug_report/bug_report.dart';
+import '/ui/screens/fake_apps/fake_reminders.dart';
+import '/ui/screens/fake_apps/fake_settings.dart';
+import '/ui/screens/home.dart';
+import '/ui/screens/library.dart';
+import '/ui/screens/onboarding/onboarding_welcome.dart';
+import '/ui/screens/settings/settings_main.dart';
+import '/ui/utils/handle_desktop_events.dart';
+import '/ui/utils/toast_notification.dart';
+import '/ui/utils/update_dialog.dart';
+import '/ui/widgets/alert_dialog.dart';
+import '/utils/global_vars.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Rhttp.init();
+  fvp.registerWith(
+    options: {
+      // fix audio cracking when seeking on Android
+      if (Platform.isAndroid) "player": {"audio.renderer": "AudioTrack"}
+    },
+  );
+  await initGlobalVars();
+  logger.i("Initializing app v${packageInfo.version}");
+  await setDefaultSettings();
+  sendUsagePing();
+  await initDb();
+  await PluginManager.init();
+  // Icons are not critical to startup -> don't await
+  downloadPluginIcons();
+  await processArgs();
+  logger.i("Starting flutter process");
+  setupErrorHandling();
+  runApp(const ViewerApp());
+}
+
+Future<void> processArgs() async {
+  logger.i("Processing args");
+
+  const skipOnboarding =
+      bool.fromEnvironment("SKIP_ONBOARDING", defaultValue: false);
+  if (skipOnboarding) {
+    logger.w("Skipping onboarding");
+    await sharedStorage.setBool("general_onboarding_completed", true);
+  }
+  const resetSettings =
+      bool.fromEnvironment("RESET_SETTINGS", defaultValue: false);
+  if (resetSettings) {
+    logger.w("Resetting settings");
+    setDefaultSettings(true);
+  }
+
+  logger.i("Finished processing args");
+}
+
+/// Set up backup error handling to avoid the flutter red screen of death
+void setupErrorHandling() {
+  bool bugReportOpen = false;
+
+  // Push BugReportScreen, guarded against opening more than once at a time
+  void openBugReportScreen(String error, String stack) {
+    final context = ViewerApp.navigatorKey.currentContext;
+    if (context != null && !bugReportOpen) {
+      bugReportOpen = true;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          settings: const RouteSettings(name: "/bug-report-emergency"),
+          builder: (context) => BugReportScreen(
+            unexpectedError: true,
+            bugReportsList: [
+              BugReport(
+                  navigatorPath: navigatorPathObserver.currentPath,
+                  exception: Exception(error),
+                  stackTrace: stack)
+            ],
+            submissionType: SubmissionType.userApproved,
+          ),
+        ),
+      ).then((_) => bugReportOpen = false);
+    }
+  }
+
+  // Replace the default red error screen with a minimal placeholder,
+  // since ErrorWidget.builder has no BuildContext to navigate with
+  ErrorWidget.builder = (FlutterErrorDetails details) {
+    return const Center(child: Text("Broken Widget"));
+  };
+
+  // Catch errors thrown by the framework (build/layout/paint)
+  FlutterError.onError = (FlutterErrorDetails details) {
+    logger.f("FlutterError: ${details.exceptionAsString()}");
+    FlutterError.presentError(details);
+    openBugReportScreen(details.exception.toString(), details.stack.toString());
+  };
+
+  // Catch async errors not caught by FlutterError (e.g. inside Futures)
+  PlatformDispatcher.instance.onError = (error, stack) {
+    logger.f("Uncaught error: $error\n$stack");
+    openBugReportScreen(error.toString(), stack.toString());
+    return true;
+  };
+}
+
+class ViewerApp extends StatefulWidget {
+  const ViewerApp({super.key});
+
+  // Static so it's reachable from main() before any state exists
+  static final GlobalKey<NavigatorState> navigatorKey =
+      GlobalKey<NavigatorState>();
+
+  @override
+  ViewerAppState createState() => ViewerAppState();
+
+  static ViewerAppState? of(BuildContext context) =>
+      context.findAncestorStateOfType<ViewerAppState>();
+}
+
+class ViewerAppState extends State<ViewerApp> with WidgetsBindingObserver {
+  // This is required to show the update dialog in the correct context
+  final GlobalKey<NavigatorState> materialAppKey = ViewerApp.navigatorKey;
+
+  late final KeyEventCallback escapeHandler;
+
+  /// Whether the app should stop showing a fake screen
+  bool concealApp = true;
+  bool updateAvailable = false;
+  bool showSettingsBadge = false;
+  UpdateManager updateManager = UpdateManager();
+
+  Future<bool> onboardingCompleted = sharedStorage
+      .getBool("general_onboarding_completed")
+      .then((value) => value ?? false);
+  Future<String> appearanceType = sharedStorage
+      .getString("appearance_launcher_appearance")
+      .then((value) => value ?? "Hedon Haven");
+  Future<ThemeMode> themeMode = getThemeMode();
+
+  /// This controls whether the preview should be currently blocked
+  bool blockPreview = false;
+
+  /// Tracks the hash of the currently hovered drop
+  bool hoveringWithLink = false;
+  int _selectedIndex = 0;
+  static List<Widget> screenList = <Widget>[
+    const HomeScreen(),
+    //const SubscriptionsScreen(),
+    const LibraryScreen(),
+    const SettingsScreen(),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+
+    initGlobalSetState(setStateMain);
+
+    // Hide app preview by default
+    // The desktops don't support app preview hiding at an OS level
+    if (Platform.isAndroid || Platform.isIOS) {
+      SecureAppSwitcher.on();
+    }
+    sharedStorage.getBool("privacy_hide_app_preview").then((value) {
+      if (!value!) {
+        // The desktops don't support app preview hiding at an OS level
+        if (Platform.isAndroid || Platform.isIOS) {
+          SecureAppSwitcher.off();
+        }
+      }
+      setState(() => hidePreview = value);
+    });
+    // For detecting app state
+    WidgetsBinding.instance.addObserver(this);
+
+    // Add global key handling for desktop
+    escapeHandler = (event) => handleEscape(event, materialAppKey);
+    HardwareKeyboard.instance.addHandler(escapeHandler);
+
+    // Enable badge when plugin update check finishes and updates are available
+    pluginUpdatesAvailableEvent.stream
+        .listen((value) => setState(() => showSettingsBadge = value != 0));
+
+    if (Platform.isAndroid || Platform.isIOS) {
+      // Listen to URL sharing coming from outside the app while app is in memory.
+      ReceiveSharingIntent.instance
+          .getMediaStream()
+          .listen((value) => handleSharedLink(value), onError: (e) {
+        logger.e("Failed to process shared item: $e");
+        showToastViaOverlay("Failed to process shared item: $e",
+            materialAppKey.currentState!.overlay!, 5);
+      });
+
+      // Get the media sharing coming from outside the app while the app is closed.
+      ReceiveSharingIntent.instance
+          .getInitialMedia()
+          .then((value) => handleSharedLink(value), onError: (e) {
+        logger.e("Failed to process shared item: $e");
+        showToastViaOverlay("Failed to process shared item: $e",
+            materialAppKey.currentState!.overlay!, 5);
+      });
+    }
+
+    performUpdate();
+
+    // Show update warning on OS that don't have update support yet
+    if (!Platform.isAndroid) {
+      // Wait for the context to be available
+      Timer.periodic(const Duration(milliseconds: 100), (timer) {
+        if (materialAppKey.currentContext != null) {
+          timer.cancel();
+          showDialog(
+              context: materialAppKey.currentContext!,
+              builder: (BuildContext context) => ThemedDialog(
+                  title: "暂不支持应用内更新！",
+                  primaryText: "关闭",
+                  onPrimary: () => Navigator.pop(context),
+                  secondaryText: "Open https://hedon-haven.top/download.html",
+                  onSecondary: () => launchUrl(
+                      Uri.parse("https://hedon-haven.top/download.html")),
+                  content: Text(
+                      "Updates are not yet supported on this OS "
+                      "(${Platform.operatingSystem}). Please check the official "
+                      "downloads page for updates.",
+                      style: Theme.of(context).textTheme.bodyLarge,
+                      textAlign: TextAlign.center)));
+        }
+      });
+    }
+
+    // sync initial tab with navigator observer
+    navigatorPathObserver.routeStack
+      ..clear()
+      ..add(["home", "library", "settings"][_selectedIndex]);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    HardwareKeyboard.instance.removeHandler(escapeHandler);
+    super.dispose();
+  }
+
+  // This is only necessary for desktops, as the mobile platforms have that feature built in
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (hidePreview) {
+      if (state == AppLifecycleState.paused ||
+          state == AppLifecycleState.inactive) {
+        if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+          logger.d("Blurring app");
+          setState(() {
+            blockPreview = true;
+          });
+        }
+      } else if (state == AppLifecycleState.resumed) {
+        if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+          logger.d("Unblurring app");
+          setState(() {
+            blockPreview = false;
+          });
+        }
+      }
+    }
+  }
+
+  Future<void> performUpdate() async {
+    try {
+      // Start getting update first, then wait for context to be available
+      updateAvailable = await updateManager.updateAvailable();
+      if (updateAvailable) {
+        // Wait for the context to be available
+        Timer.periodic(const Duration(milliseconds: 100), (timer) {
+          if (materialAppKey.currentContext != null) {
+            timer.cancel();
+            showUpdateDialog(updateManager, materialAppKey.currentContext!);
+          }
+        });
+      }
+    } catch (e, stacktrace) {
+      logger.e("Error checking for app update (waiting for context + 1 second "
+          "before displaying to user): $e\n$stacktrace");
+      // Wait for the context to be available
+      Timer.periodic(const Duration(milliseconds: 100), (timer) async {
+        if (materialAppKey.currentState?.overlay != null) {
+          timer.cancel();
+          // wait a bit more to make sure the message appears
+          await Future.delayed(const Duration(seconds: 1));
+          showToastViaOverlay("Error checking for app update: $e",
+              materialAppKey.currentState!.overlay!, 5);
+        }
+      });
+    }
+  }
+
+  void parentStopConcealing() {
+    setState(() => concealApp = false);
+  }
+
+  void setStateMain() {
+    logger.w("Global setState called");
+
+    // reload ui vars to force a true reload
+    onboardingCompleted = sharedStorage
+        .getBool("general_onboarding_completed")
+        .then((value) => value ?? false);
+    appearanceType = sharedStorage
+        .getString("appearance_launcher_appearance")
+        .then((value) => value ?? "Hedon Haven");
+    themeMode = getThemeMode();
+
+    // Set current screen to home
+    _selectedIndex = 0;
+
+    // Clear navigation stack
+    materialAppKey.currentState?.popUntil((route) => route.isFirst);
+
+    setState(() {});
+  }
+
+  Future<void> handleDroppedLink(PerformDropEvent event) async {
+    event.session.items.first.dataReader!.getValue(Formats.uri, (value) async {
+      // Only accept http and https links
+      if (value != null &&
+          (value.uri.scheme == "https" || value.uri.scheme == "http")) {
+        logger.i("Received dropped link: ${value.uri.toString()}");
+        try {
+          await handleExternalLink(
+              value.uri, materialAppKey.currentState!.context);
+        } catch (e, st) {
+          logger.e("Error handling dropped link: $e\n$st");
+          showToastViaOverlay("Error handling dropped link: $e",
+              materialAppKey.currentState!.overlay!, 5);
+        }
+      } else {
+        logger.w("Dropped non-http/https link");
+        showToastViaOverlay("Dropped non-http/https link",
+            materialAppKey.currentState!.overlay!, 5);
+      }
+    }, onError: (error) {
+      logger.e("Error reading dropped link: $error");
+      showToastViaOverlay("Error reading dropped link: $error",
+          materialAppKey.currentState!.overlay!, 5);
+    });
+  }
+
+  Future<void> handleSharedLink(
+      List<SharedMediaFile> sharedMediaFileList) async {
+    for (var item in sharedMediaFileList) {
+      try {
+        Uri parsedUri = Uri.parse(item.path);
+        if (parsedUri.scheme == "http" || parsedUri.scheme == "https") {
+          logger.i("Received shared link: ${parsedUri.toString()}");
+          try {
+            await handleExternalLink(
+                parsedUri, materialAppKey.currentState!.context);
+          } catch (e, st) {
+            logger.e("Failed to handle shared link: $e\n$st");
+            showToastViaOverlay("Failed to handle shared link: $e",
+                materialAppKey.currentState!.overlay!, 5);
+          }
+        }
+      } catch (e, st) {
+        logger.e("Failed to parse shared link into Uri: $e\n$st");
+        showToastViaOverlay("Failed to parse shared link into Uri: $e",
+            materialAppKey.currentState!.overlay!, 5);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DynamicColorBuilder(
+        builder: (ColorScheme? lightColorScheme, ColorScheme? darkColorScheme) {
+      return FutureBuilder<ThemeMode?>(
+          future: themeMode,
+          builder: (context, snapshot) {
+            final isMobile = Platform.isAndroid || Platform.isIOS;
+            return MaterialApp(
+                title: "Hedon Haven",
+                theme: ThemeData(
+                  // Disable click
+                  splashFactory: isMobile
+                      ? InkRipple.splashFactory
+                      : NoSplash.splashFactory,
+                  // Try to use system colors first and fallback to Green
+                  colorScheme: lightColorScheme ??
+                      ColorScheme.fromSwatch(primarySwatch: Colors.green),
+                ),
+                darkTheme: ThemeData(
+                  splashFactory: isMobile
+                      ? InkRipple.splashFactory
+                      : NoSplash.splashFactory,
+                  colorScheme: darkColorScheme ??
+                      ColorScheme.fromSwatch(
+                          primarySwatch: Colors.green,
+                          brightness: Brightness.dark),
+                ),
+                themeMode: snapshot.data ?? ThemeMode.system,
+                navigatorKey: materialAppKey,
+                navigatorObservers: [navigatorPathObserver],
+                /*
+                /// Overlay a debug button over the entire app
+                builder: (context, child) {
+                  return Stack(children: [
+                    child!,
+                    Positioned(
+                      bottom: 20,
+                      right: 20,
+                      child: FloatingActionButton(
+                        mini: true,
+                        onPressed: () {
+                          // Debug action here
+                          throw Exception("Test error from debug button");
+                        },
+                        child: const Icon(Icons.bug_report),
+                      ),
+                    ),
+                  ]);
+                },
+                */
+                home: DropRegion(
+                  // Formats this region can accept.
+                  formats: [Formats.uri],
+                  hitTestBehavior: HitTestBehavior.opaque,
+                  // Cannot properly test for https/http here due to callback nature of onDropOver
+                  onDropOver: (event) {
+                    return event.session.items.first.canProvide(Formats.uri)
+                        ? DropOperation.copy
+                        : DropOperation.none;
+                  },
+                  onDropEnter: (event) =>
+                      setState(() => hoveringWithLink = true),
+                  onDropLeave: (event) =>
+                      setState(() => hoveringWithLink = false),
+                  onPerformDrop: (event) => handleDroppedLink(event),
+                  child: Stack(children: [
+                    FutureBuilder<bool?>(
+                        future: onboardingCompleted,
+                        builder: (context, snapshotParent) {
+                          // Don't show anything until the future is done
+                          if (snapshotParent.connectionState ==
+                              ConnectionState.waiting) {
+                            return const SizedBox();
+                          }
+                          return !snapshotParent.data!
+                              ? WelcomeScreen()
+                              : FutureBuilder<String?>(
+                                  future: appearanceType,
+                                  builder: (context, snapshot) {
+                                    // Don't show anything until the future is done
+                                    if (snapshot.connectionState ==
+                                        ConnectionState.waiting) {
+                                      return const SizedBox();
+                                    }
+                                    if (!concealApp) {
+                                      logger.i(
+                                          "App concealing was disabled, loading default app");
+                                      return buildRealApp();
+                                    }
+                                    switch (snapshot.data!) {
+                                      case "GSM Settings":
+                                        return FakeSettingsScreen(
+                                            parentStopConcealing:
+                                                parentStopConcealing);
+                                      case "Reminders":
+                                        return FakeRemindersScreen(
+                                            parentStopConcealing:
+                                                parentStopConcealing);
+                                      default:
+                                        return buildRealApp();
+                                    }
+                                  });
+                        }),
+                    if (blockPreview) ...[
+                      Positioned.fill(
+                        child: Container(color: Colors.black),
+                      ),
+                    ]
+                  ]),
+                ));
+          });
+    });
+  }
+
+  Widget buildRealApp() {
+    return Scaffold(
+        bottomNavigationBar: NavigationBar(
+            destinations: <Widget>[
+              NavigationDestination(
+                icon: _selectedIndex == 0
+                    ? const Icon(Icons.home)
+                    : const Icon(Icons.home_outlined),
+                label: "首页",
+              ),
+              // NavigationDestination(
+              //   icon: _selectedIndex == 1
+              //       ? const Icon(Icons.subscriptions)
+              //       : const Icon(Icons.subscriptions_outlined),
+              //   label: "订阅",
+              // ),
+              NavigationDestination(
+                icon: _selectedIndex == 1
+                    ? const Icon(Icons.video_library)
+                    : const Icon(Icons.video_library_outlined),
+                label: "媒体库",
+              ),
+              NavigationDestination(
+                icon: Badge(
+                  isLabelVisible: showSettingsBadge,
+                  smallSize: 10,
+                  alignment: AlignmentDirectional.centerEnd,
+                  child: _selectedIndex == 2
+                      ? const Icon(Icons.settings)
+                      : const Icon(Icons.settings_outlined),
+                ),
+                label: "设置",
+              ),
+            ],
+            selectedIndex: _selectedIndex,
+            onDestinationSelected: (index) {
+              setState(() {
+                _selectedIndex = index;
+                // Update navigator path observer root
+                navigatorPathObserver.routeStack
+                  ..clear()
+                  ..add(["home", "library", "settings"][index]);
+              });
+            }),
+        body: ClipRect(
+          child: Stack(children: [
+            ...screenList.asMap().entries.map((entry) => AnimatedSlide(
+                  duration: const Duration(milliseconds: 200),
+                  curve: Curves.easeInOut,
+                  offset: entry.key == _selectedIndex
+                      ? Offset.zero
+                      : Offset(entry.key < _selectedIndex ? -1.0 : 1.0, 0),
+                  child: entry.value,
+                )),
+            if (hoveringWithLink) ...[
+              Positioned.fill(
+                // Fixes wrong colorScheme being used (wrong context)
+                child: Builder(
+                    builder: (context) => Container(
+                        color:
+                            Theme.of(context).colorScheme.surfaceContainerHigh,
+                        child: Padding(
+                            padding: EdgeInsets.all(100),
+                            child: Container(
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .surfaceContainerHighest,
+                                child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.center,
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    spacing: 50,
+                                    children: [
+                                      Text("拖入以打开",
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .headlineLarge!
+                                              .copyWith(
+                                                  fontWeight: FontWeight.bold,
+                                                  color: Theme.of(context)
+                                                      .colorScheme
+                                                      .onSurface)),
+                                      Icon(Icons.open_in_browser, size: 70)
+                                    ]))))),
+              ),
+            ]
+          ]),
+        ));
+  }
+}

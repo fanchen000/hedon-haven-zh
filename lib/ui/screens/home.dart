@@ -1,0 +1,290 @@
+import 'package:material_ui/material_ui.dart';
+
+import '/services/banner_manager.dart';
+import '/services/bug_report_manager.dart';
+import '/services/loading_handler.dart';
+import '/services/plugin_manager.dart';
+import '/ui/screens/bug_report/bug_reports_list.dart';
+import '/ui/widgets/sliver_header.dart';
+import '/utils/global_vars.dart';
+import '/utils/plugin_interface/plugin_interface.dart';
+import '/utils/universal_formats.dart';
+import 'search.dart';
+import 'video_list.dart';
+
+class HomeScreen extends StatefulWidget {
+  /// Only used to open a specific homepage from an external link
+  final PluginInterface? provider;
+
+  /// Only used when opening external links
+  final int? pageCount;
+
+  const HomeScreen({super.key, this.provider, this.pageCount});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  Future<List<UniversalVideoPreview>?> videoResults = Future.value([]);
+  LoadingHandler loadingHandler =
+      LoadingHandler(navPath: navigatorPathObserver.currentPath);
+  bool isLoading = true;
+  bool noPluginsEnabled = false;
+
+  late Future<({String severity, String title, String message})?> banner;
+
+  @override
+  void initState() {
+    super.initState();
+
+    banner = getBanner(context);
+
+    // Listen for changes to appearance_homepage_enabled setting
+    reloadVideoListEvent.stream.listen((_) {
+      sharedStorage.getBool("appearance_homepage_enabled").then((value) {
+        if (value!) {
+          loadingHandler =
+              LoadingHandler(navPath: navigatorPathObserver.currentPath);
+          videoResults = loadingHandler.getHomePages(null).whenComplete(() {
+            logger.d("ResultsIssues Map: ${loadingHandler.resultsBugReports}");
+            setState(() {});
+          });
+        } else {
+          videoResults = Future.value([]);
+        }
+        setState(() => isLoading = false);
+      });
+      PluginManager.getProviders(ProviderType.homepage).then((value) {
+        if (value.isEmpty) {
+          setState(() => noPluginsEnabled = true);
+        }
+      });
+    });
+
+    if (widget.provider != null && widget.pageCount != null) {
+      videoResults = loadingHandler
+          .getHomePages(null, [widget.provider!]).whenComplete(() {
+        logger.d("ResultsIssues Map: ${loadingHandler.resultsBugReports}");
+        // Update the scraping report button
+        setState(() => isLoading = false);
+      });
+    } else {
+      sharedStorage.getBool("appearance_homepage_enabled").then((value) {
+        if (value!) {
+          videoResults = loadingHandler.getHomePages(null).whenComplete(() {
+            logger.d("ResultsIssues Map: ${loadingHandler.resultsBugReports}");
+            // Update the scraping report button
+            if (mounted) setState(() => isLoading = false);
+          });
+        }
+      });
+    }
+
+    PluginManager.getProviders(ProviderType.homepage).then((value) {
+      if (value.isEmpty) {
+        setState(() => noPluginsEnabled = true);
+      }
+    });
+  }
+
+  Future<List<UniversalVideoPreview>?> loadMoreResults() async {
+    setState(() => isLoading = true);
+    var results = await loadingHandler.getHomePages(await videoResults);
+    // Updates the scraping report button
+    setState(() => isLoading = false);
+    return results;
+  }
+
+  void createResultsBugReport() async {
+    List<BugReport> reportedBugs = await Navigator.push(
+          context,
+          MaterialPageRoute(
+            settings: RouteSettings(name: "/bug-reports-list-scraping-mode"),
+            builder: (context) => BugReportsListScreen(
+                scrapingReportMode: true,
+                bugReportsList: loadingHandler.resultsBugReports),
+          ),
+        ) ??
+        [];
+
+    // Remove all reported bugs
+    loadingHandler.resultsBugReports
+        .removeWhere((uvp) => reportedBugs.contains(uvp));
+
+    setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        iconTheme: IconThemeData(color: Theme.of(context).colorScheme.primary),
+        actions: [
+          if (loadingHandler.resultsBugReports.isNotEmpty && !isLoading) ...[
+            IconButton(
+                icon: Icon(
+                    color: Theme.of(context).colorScheme.error,
+                    Icons.error_outline),
+                onPressed: () => createResultsBugReport())
+          ],
+          Spacer(),
+          IconButton(
+            icon: Icon(
+                color: Theme.of(context).colorScheme.primary, Icons.search),
+            onPressed: () => Navigator.push(
+              context,
+              PageRouteBuilder(
+                settings: RouteSettings(name: "/search_screen"),
+                pageBuilder: (context, animation, _) =>
+                    SearchScreen(previousSearch: UniversalSearchRequest()),
+                transitionsBuilder: (context, animation, _, child) {
+                  final curved = CurvedAnimation(
+                      parent: animation, curve: Curves.easeInOut);
+                  final topOffset =
+                      kToolbarHeight + MediaQuery.of(context).padding.top;
+                  final screenHeight = MediaQuery.of(context).size.height;
+
+                  return AnimatedBuilder(
+                    animation: curved,
+                    child: child,
+                    builder: (_, child) => Stack(
+                      children: [
+                        Positioned(
+                          top: 0,
+                          left: 0,
+                          right: 0,
+                          height: topOffset +
+                              curved.value * (screenHeight - topOffset),
+                          child: ClipRect(
+                            child: ShaderMask(
+                              blendMode: BlendMode.dstIn,
+                              shaderCallback: (rect) => LinearGradient(
+                                begin: Alignment.topCenter,
+                                end: Alignment.bottomCenter,
+                                // AppBar region fades in, body stays fully opaque
+                                colors: [
+                                  Colors.black.withValues(alpha: curved.value),
+                                  Colors.black
+                                ],
+                                stops: [
+                                  topOffset / rect.height,
+                                  topOffset / rect.height
+                                ],
+                              ).createShader(rect),
+                              child: OverflowBox(
+                                alignment: Alignment.topCenter,
+                                maxHeight: screenHeight,
+                                child: child,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+                transitionDuration: const Duration(milliseconds: 300),
+              ),
+            ),
+          ),
+        ],
+      ),
+      body: SafeArea(
+          child: FutureBuilder<bool?>(
+              future: sharedStorage.getBool("appearance_homepage_enabled"),
+              builder: (context, snapshot) {
+                // Don't show anything until the future is done
+                if (snapshot.connectionState == ConnectionState.waiting) {
+                  return const SizedBox();
+                }
+                return snapshot.data!
+                    ? CustomScrollView(slivers: [
+                        buildBanner(),
+                        VideoList(
+                          videoList: videoResults,
+                          scrollController: ScrollController(),
+                          reloadInitialResults: () =>
+                              loadingHandler.getHomePages(null),
+                          loadMoreResults: loadMoreResults,
+                          noResultsMessage:
+                              "首页没有内容且未报告错误，请反馈给开发者",
+                          noResultsErrorMessage: "加载首页失败",
+                          showScrapingReportButton: true,
+                          bugReports: loadingHandler.resultsBugReports,
+                          ignoreInternetError: false,
+                          noPluginsEnabled: noPluginsEnabled,
+                          noPluginsMessage:
+                              "尚未启用首页内容来源，请至少在一个插件中启用首页来源",
+                        )
+                      ])
+                    : CustomScrollView(slivers: [
+                        buildBanner(),
+                        SliverToBoxAdapter(
+                            child: Text(
+                                "首页已在“设置 > 外观 > 启用首页”中关闭",
+                                textAlign: TextAlign.center,
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .titleLarge!
+                                    .copyWith(
+                                        color: Theme.of(context)
+                                            .colorScheme
+                                            .error)))
+                      ]);
+              })),
+    );
+  }
+
+  Widget buildBanner() {
+    return FutureBuilder<({String severity, String title, String message})?>(
+        future: banner,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting ||
+              snapshot.data == null) {
+            return const SliverToBoxAdapter();
+          }
+          return FloatingDynamicSliverHeader(
+              pinned: false,
+              floating: false,
+              child: Container(
+                  margin:
+                      const EdgeInsets.only(left: 10, right: 10, bottom: 10),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(12),
+                    color: snapshot.data!.severity == "important"
+                        ? Theme.of(context).colorScheme.errorContainer
+                        : Theme.of(context).colorScheme.surfaceVariant,
+                  ),
+                  child: Padding(
+                      padding: const EdgeInsets.all(5),
+                      child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          mainAxisSize: MainAxisSize.min,
+                          spacing: 4,
+                          children: [
+                            Text(
+                              snapshot.data!.title,
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .titleLarge
+                                  ?.copyWith(
+                                    color:
+                                        Theme.of(context).colorScheme.onSurface,
+                                  ),
+                            ),
+                            Text(
+                              snapshot.data!.message,
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodyLarge
+                                  ?.copyWith(
+                                    color: Theme.of(context)
+                                        .colorScheme
+                                        .onSurfaceVariant,
+                                  ),
+                            ),
+                          ]))));
+        });
+  }
+}

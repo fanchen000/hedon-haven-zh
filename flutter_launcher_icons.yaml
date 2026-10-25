@@ -1,0 +1,40 @@
+# flutter pub run flutter_launcher_icons && ./assets/launcher-icon/rename-generated-icons.sh stock
+flutter_launcher_icons:
+  image_path: "assets/launcher-icon/stock.png"
+
+  min_sdk_android: 24
+  adaptive_icon_background: "#FFFFFF"
+
+  # Only run each android "section" one at a time
+  android: "stock"
+  image_path_android: "assets/launcher-icon/android/stock.png"
+  adaptive_icon_foreground: "assets/launcher-icon/android/stock.png"
+  adaptive_icon_monochrome: "assets/launcher-icon/android/monochrome/stock.png"
+
+#  android: "fake_settings"
+#  image_path_android: "assets/launcher-icon/android/fake_settings.png"
+#  adaptive_icon_foreground: "assets/launcher-icon/android/fake_settings.png"
+#  adaptive_icon_monochrome: "assets/launcher-icon/android/monochrome/fake_settings.png"
+
+#  android: "reminders"
+#  image_path_android: "assets/launcher-icon/android/reminders.png"
+#  adaptive_icon_foreground: "assets/launcher-icon/android/reminders.png"
+#  adaptive_icon_monochrome: "assets/launcher-icon/android/monochrome/reminders.png"
+
+  ios: true
+  remove_alpha_ios: true
+  image_path_ios: "assets/launcher-icon/ios/stock.png"
+  # image_path_ios_dark_transparent: "assets/icon/icon_dark.png"
+  # image_path_ios_tinted_grayscale: "assets/icon/icon_tinted.png"
+  # desaturate_tinted_to_grayscale_ios: true
+  # background_color_ios: "#ffffff"
+
+
+  windows:
+    generate: true
+    icon_size: 256
+
+
+  macos:
+    generate: true
+    image_path: "assets/launcher-icon/macos/stock.png"

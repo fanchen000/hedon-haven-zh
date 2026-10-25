@@ -1,0 +1,601 @@
+import 'package:material_ui/material_ui.dart';
+import 'package:page_transition/page_transition.dart';
+
+import '/services/bug_report_manager.dart';
+import '/services/plugin_manager.dart';
+import '/ui/screens/bug_report/bug_report.dart';
+import '/ui/screens/settings/settings_launcher_appearance.dart';
+import '/ui/screens/settings/settings_plugins/install_3rd_party_plugin.dart';
+import '/ui/utils/toast_notification.dart';
+import '/ui/widgets/alert_dialog.dart';
+import '/ui/widgets/options_switch.dart';
+import '/utils/exceptions.dart';
+import '/utils/global_vars.dart';
+import '/utils/plugin_interface/plugin_interface.dart';
+
+class PluginsScreen extends StatefulWidget {
+  final bool partOfOnboarding;
+
+  const PluginsScreen({super.key, this.partOfOnboarding = false});
+
+  @override
+  State<PluginsScreen> createState() => _PluginsScreenState();
+}
+
+class _PluginsScreenState extends State<PluginsScreen> {
+  /// To avoid sending multiple events if multiple plugins/settings are changed
+  bool sendPluginsChangedEvent = false;
+  bool checkingForUpdatesInProgress = false;
+  String? pluginCodeNameInProgress;
+
+  // Cached lists from PluginManager
+  List<PluginInterface> _allPlugins = [];
+  List<PluginInterface> _enabledPlugins = [];
+  List<PluginInterface> _failedPlugins = [];
+  List<PluginInterface> _updatablePlugins = [];
+
+  Future<void> _loadPluginLists() async {
+    final (all, enabled, failed, updatable) = await (
+      PluginManager.getAllPlugins(),
+      PluginManager.getEnabledPlugins(),
+      PluginManager.getFailedPlugins(),
+      PluginManager.getUpdatablePlugins()
+    ).wait;
+    if (mounted) {
+      setState(() {
+        _allPlugins = all;
+        _enabledPlugins = enabled;
+        _failedPlugins = failed;
+        _updatablePlugins = updatable;
+      });
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPluginLists();
+
+    // Reload plugin lists if updates become available
+    pluginUpdatesAvailableEvent.stream.listen((_) => _loadPluginLists());
+  }
+
+  void handleNextButton() async {
+    // Check if user enabled at least one plugin
+    if ((await PluginManager.getEnabledPlugins()).isNotEmpty) {
+      Navigator.push(
+          context,
+          PageTransition(
+              settings: RouteSettings(name: "/onboarding_launcher_appearance"),
+              type: PageTransitionType.rightToLeftJoined,
+              childCurrent: widget,
+              child: LauncherAppearance(partOfOnboarding: true)));
+    } else {
+      showDialog(
+          context: context,
+          builder: (BuildContext context) {
+            return ThemedDialog(
+                title: "没有启用的插件",
+                primaryText: "返回",
+                onPrimary: Navigator.of(context).pop,
+                secondaryText: "仍然继续",
+                onSecondary: () => Navigator.push(
+                    context,
+                    PageTransition(
+                        settings: RouteSettings(
+                            name: "/onboarding_launcher_appearance"),
+                        type: PageTransitionType.rightToLeftJoined,
+                        childCurrent: widget,
+                        child: LauncherAppearance(partOfOnboarding: true))),
+                content: Text(
+                    "确定不启用任何插件就继续吗？"));
+          });
+    }
+  }
+
+  /// TODO: Prompt user to delete plugin if not bundled plugin
+  void _togglePlugin(PluginInterface plugin, bool newState) async {
+    if (newState) {
+      try {
+        await PluginManager.enablePlugin(plugin);
+      } catch (e, st) {
+        showToast(
+            "Failed to enable ${plugin.prettyName} due to $e\n$st", context);
+      }
+    } else {
+      try {
+        await PluginManager.disablePlugin(plugin);
+      } catch (e, st) {
+        showToast(
+            "Failed to disable ${plugin.prettyName} due to $e\n$st", context);
+      }
+    }
+    sendPluginsChangedEvent = true;
+    _loadPluginLists();
+  }
+
+  void _setAsProvider(PluginInterface plugin, Set<ProviderType> provides,
+      ProviderType updateType, bool newState) async {
+    // we can directly modify provides, since it'll be thrown away on setState call
+    if (newState) {
+      provides.add(updateType);
+    } else {
+      provides.remove(updateType);
+    }
+    await PluginManager.setAsProvider(plugin, provides);
+    sendPluginsChangedEvent = true;
+    _loadPluginLists();
+  }
+
+  /// Manages updating one plugin at a time
+  Future<void> _updateSinglePlugin(PluginInterface plugin) async {
+    setState(() => pluginCodeNameInProgress = plugin.codeName);
+    try {
+      await PluginManager.updatePlugin(plugin);
+    } catch (e, st) {
+      showErrorDialog("Failed to update ${plugin.prettyName}",
+          "Failed to update ${plugin.prettyName} due to $e\n$st");
+    }
+    setState(() => pluginCodeNameInProgress = null);
+  }
+
+  void showErrorDialog(String title, String message) async {
+    await showDialog(
+        context: context,
+        builder: (BuildContext context) {
+          return ThemedDialog(
+            title: title,
+            primaryText: "Ok",
+            onPrimary: () {
+              Navigator.pop(context);
+            },
+            content: Container(
+              width: double.infinity,
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surface,
+                borderRadius: BorderRadius.circular(5.0),
+              ),
+              padding: const EdgeInsets.all(5.0),
+              child: Text(message.trim(),
+                  style: Theme.of(context).textTheme.bodyMedium),
+            ),
+          );
+        });
+  }
+
+  void _showPluginInitErrorDialog(PluginInterface plugin) async {
+    var data = await PluginManager.getPluginError(plugin);
+    final bool customException =
+        data != null ? data.$1 is CustomException : false;
+    final String errorMessage =
+        data != null ? "${data.$1}\n\n${data.$2}" : "Unknown error!?";
+    showDialog(
+        context: context,
+        builder: (BuildContext context) => ThemedDialog(
+            title: "插件初始化错误",
+            // TODO: Add a link to proxy settings in case of AgeGateException or BannedCountryException
+            primaryText: customException ? "Ok" : "反馈问题",
+            onPrimary: () {
+              if (customException) {
+                Navigator.pop(context);
+              } else {
+                // TODO: Prevent user from submitting a duplicate report
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    settings: RouteSettings(name: "/bug-report"),
+                    builder: (context) => BugReportScreen(
+                        submissionType: SubmissionType.userApproved,
+                        bugReportsList: [
+                          PluginBugReport(
+                              navigatorPath: navigatorPathObserver.currentPath,
+                              exception: data!.$1,
+                              stackTrace: data.$2.toString(),
+                              pluginCodeName: plugin.codeName,
+                              isBundledPlugin: plugin.isBundledPlugin,
+                              debugObject: {})
+                        ]),
+                  ),
+                ).then((value) => Navigator.pop(context));
+              }
+            },
+            secondaryText: customException ? null : "关闭",
+            onSecondary: () => customException ? null : Navigator.pop(context),
+            content: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                      "The ${plugin.prettyName} plugin failed to initialize with the following error:",
+                      style: Theme.of(context).textTheme.titleMedium),
+                  SizedBox(height: 5),
+                  Flexible(
+                      child: TextFormField(
+                          initialValue: errorMessage,
+                          readOnly: true,
+                          maxLines: null,
+                          scrollController: ScrollController(),
+                          style: TextStyle(
+                              color: Theme.of(context).colorScheme.onSurface),
+                          textAlignVertical: TextAlignVertical.top,
+                          decoration: InputDecoration(
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(12),
+                                borderSide: BorderSide.none,
+                              ),
+                              contentPadding: const EdgeInsets.symmetric(
+                                  vertical: 10, horizontal: 10),
+                              filled: true,
+                              fillColor: Theme.of(context).colorScheme.surface,
+                              hoverColor:
+                                  Theme.of(context).colorScheme.surface)))
+                ])));
+  }
+
+  void showPluginUpdateDialog(PluginInterface plugin) {
+    showDialog(
+        context: context,
+        builder: (BuildContext context) => FutureBuilder<UpdateInfo?>(
+            future: PluginManager.getUpdateInfoFor(plugin),
+            builder: (context, snapshot) {
+              // Don't show anything until the future is done
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const SizedBox();
+              }
+              final UpdateInfo updateInfo = snapshot.data!;
+              final String details = "Codename: ${plugin.codeName}\n"
+                  "Service: ${plugin.serviceUrl}\n\n"
+                  "Changelog for ${plugin.version} -> ${updateInfo.newVersion}:\n"
+                  "${updateInfo.changelog.map((s) => "• $s").join("\n")}\n\n"
+                  "下载地址：${updateInfo.downloadUrl}";
+              return ThemedDialog(
+                  title: "Update ${plugin.prettyName}",
+                  primaryText: "下载并安装",
+                  onPrimary: () {
+                    // Start update but don't wait for it to finish and immediately close dialog
+                    _updateSinglePlugin(plugin);
+                    Navigator.of(context).pop();
+                  },
+                  secondaryText: "取消",
+                  onSecondary: Navigator.of(context).pop,
+                  content: Column(mainAxisSize: MainAxisSize.min, children: [
+                    Text(
+                        "An update is available for ${plugin.prettyName}. Update now?"),
+                    Container(
+                      width: double.infinity,
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.surface,
+                        borderRadius: BorderRadius.circular(5.0),
+                      ),
+                      padding: const EdgeInsets.all(5.0),
+                      child: SelectableText(details,
+                          style: Theme.of(context).textTheme.bodySmall),
+                    ),
+                  ]));
+            }));
+  }
+
+  void showAboutPluginDialog(PluginInterface plugin) async {
+    String metadata = "Codename: ${plugin.codeName}\n"
+        "Service: ${plugin.serviceUrl}\n"
+        "Handle URLs: ${plugin.handleUrls.join(", ")}\n"
+        "Version: ${plugin.version}\n"
+        "Developer: ${plugin.developer}\n"
+        "Contact email: ${plugin.contactEmail}\n"
+        "Description: ${plugin.description}\n"
+        "Update URL: ${plugin.updateUrl ?? (plugin.isBundledPlugin ? "Bundled plugins are updated with the app" : "暂不支持更新")}";
+    await showDialog(
+        context: context,
+        builder: (BuildContext context) => ThemedDialog(
+            title: "About ${plugin.prettyName}",
+            primaryText: "Close",
+            onPrimary: () => Navigator.pop(context),
+            content: SingleChildScrollView(
+                child: Column(
+                    spacing: 10,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                  Text(
+                      plugin.isBundledPlugin
+                          ? "内置插件，由 Hedon Haven 开发者开发和测试。"
+                          : "第三方插件，未经 Hedon Haven 测试或认可。",
+                      style: Theme.of(context).textTheme.bodyLarge),
+                  Container(
+                    width: double.infinity,
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.surface,
+                      borderRadius: BorderRadius.circular(5.0),
+                    ),
+                    padding: const EdgeInsets.all(5.0),
+                    child: SelectableText(metadata,
+                        style: Theme.of(context).textTheme.bodyMedium),
+                  ),
+                  if (!plugin.isBundledPlugin)
+                    ListTile(
+                        trailing: const Icon(Icons.delete_forever,
+                            size: 40, color: Colors.red),
+                        contentPadding: EdgeInsets.only(left: 16, right: 8),
+                        title: const Text("删除第三方插件"),
+                        subtitle: Text(
+                            "永久删除此插件的文件及配置"),
+                        onTap: () async {
+                          await PluginManager.deletePlugin(plugin);
+                          _loadPluginLists();
+                          Navigator.of(context).pop();
+                        })
+                ]))));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+        onPopInvoked: (_) =>
+            sendPluginsChangedEvent ? reloadVideoListEvent.add(null) : null,
+        child: Scaffold(
+            appBar: AppBar(
+                // Hide back button in onboarding
+                automaticallyImplyLeading: !widget.partOfOnboarding,
+                iconTheme:
+                    IconThemeData(color: Theme.of(context).colorScheme.primary),
+                title: widget.partOfOnboarding
+                    ? Center(child: Text("插件"))
+                    : const Text("插件"),
+                actions: buildAdditionalOptionsButton()),
+            body: SafeArea(
+                child: Padding(
+                    padding: const EdgeInsets.all(8),
+                    child: Column(children: [
+                      Expanded(
+                          child: ListView.builder(
+                        itemCount: _allPlugins.length,
+                        itemBuilder: (context, index) {
+                          PluginInterface plugin = _allPlugins[index];
+                          return OptionsSwitch(
+                              leadingWidget:
+                                  buildOptionsSwitchLeadingWidget(plugin),
+                              trailingWidget: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    if (_updatablePlugins.contains(plugin))
+                                      pluginCodeNameInProgress ==
+                                              plugin.codeName
+                                          ? CircularProgressIndicator()
+                                          : IconButton(
+                                              onPressed:
+                                                  pluginCodeNameInProgress !=
+                                                          null
+                                                      ? null
+                                                      : () =>
+                                                          showPluginUpdateDialog(
+                                                              plugin),
+                                              icon: Icon(
+                                                Icons.download,
+                                                color: Theme.of(context)
+                                                    .colorScheme
+                                                    .error,
+                                              )),
+                                    IconButton(
+                                        onPressed:
+                                            pluginCodeNameInProgress != null
+                                                ? null
+                                                : () {
+                                                    showDialog(
+                                                        context: context,
+                                                        builder: (BuildContext
+                                                                context) =>
+                                                            buildPluginOptions(
+                                                                plugin));
+                                                  },
+                                        icon: const Icon(Icons.settings))
+                                  ]),
+                              title: plugin.prettyName,
+                              subTitle: plugin.serviceUrl,
+                              switchState: _enabledPlugins.contains(plugin),
+                              nonInteractive:
+                                  pluginCodeNameInProgress != null ||
+                                      _failedPlugins.contains(plugin),
+                              reduceHorizontalBordersOnly: true,
+                              onToggled: (toggleValue) =>
+                                  _togglePlugin(plugin, toggleValue));
+                        },
+                      )),
+                      if (widget.partOfOnboarding) ...[
+                        Spacer(),
+                        Padding(
+                            padding: EdgeInsets.all(12),
+                            child: Row(children: [
+                              Align(
+                                  alignment: Alignment.bottomLeft,
+                                  child: ElevatedButton(
+                                      style: TextButton.styleFrom(
+                                          backgroundColor: Theme.of(context)
+                                              .colorScheme
+                                              .surfaceVariant),
+                                      onPressed: () =>
+                                          Navigator.of(context).pop(),
+                                      child: Text("返回",
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .titleMedium
+                                              ?.copyWith(
+                                                  color: Theme.of(context)
+                                                      .colorScheme
+                                                      .onSurfaceVariant)))),
+                              Spacer(),
+                              Align(
+                                  alignment: Alignment.bottomRight,
+                                  child: ElevatedButton(
+                                      style: TextButton.styleFrom(
+                                          backgroundColor: Theme.of(context)
+                                              .colorScheme
+                                              .primary),
+                                      onPressed: () => handleNextButton(),
+                                      child: Text("下一步",
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .titleMedium
+                                              ?.copyWith(
+                                                  color: Theme.of(context)
+                                                      .colorScheme
+                                                      .onPrimary))))
+                            ]))
+                      ]
+                    ])))));
+  }
+
+  List<Widget> buildAdditionalOptionsButton() {
+    if (checkingForUpdatesInProgress) {
+      return [CircularProgressIndicator(padding: const EdgeInsets.all(10))];
+    }
+    return [
+      PopupMenuButton<String>(
+          enabled: pluginCodeNameInProgress == null,
+          icon: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Icon(Icons.extension),
+              Positioned(
+                right: -8,
+                bottom: -8,
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    Icon(Icons.circle,
+                        size: 18, color: Theme.of(context).colorScheme.surface),
+                    Icon(Icons.add, size: 18),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          offset: Offset(0, 50),
+          color: Theme.of(context).colorScheme.surfaceVariant,
+          itemBuilder: (context) => [
+                PopupMenuItem(
+                    onTap: () => Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                                settings: RouteSettings(
+                                    name: "/install_3rd_party_plugin"),
+                                builder: (context) =>
+                                    Install3rdPartyPluginScreen())).then((_) {
+                          _loadPluginLists();
+                        }),
+                    child: Row(spacing: 10, children: [
+                      Icon(Icons.add),
+                      Text("安装新插件")
+                    ])),
+                PopupMenuItem(
+                    onTap: () async {
+                      setState(() => checkingForUpdatesInProgress = true);
+                      await PluginManager.checkForPluginUpdates();
+                      setState(() => checkingForUpdatesInProgress = false);
+                    },
+                    child: Row(spacing: 10, children: [
+                      Icon(Icons.update),
+                      Text("检查插件更新")
+                    ])),
+                PopupMenuItem(
+                    onTap: () => showToast(
+                        "Not yet implemented, please click each update manually",
+                        context),
+                    child: Row(spacing: 10, children: [
+                      Icon(Icons.system_update_alt),
+                      Text("更新全部插件")
+                    ])),
+              ])
+    ];
+  }
+
+  Widget buildOptionsSwitchLeadingWidget(PluginInterface plugin) {
+    return _failedPlugins.contains(plugin)
+        ? IconButton(
+            color: Theme.of(context).colorScheme.primary,
+            onPressed: () => _showPluginInitErrorDialog(plugin),
+            icon: Icon(
+                size: 30,
+                color: Theme.of(context).colorScheme.error,
+                Icons.report_problem),
+          )
+        : IconButton(
+            color: Theme.of(context).colorScheme.primary,
+            onPressed: () => showAboutPluginDialog(plugin),
+            icon: Badge(
+                label: Icon(Icons.info,
+                    color: Theme.of(context).colorScheme.onSurface, size: 12),
+                backgroundColor: Colors.transparent,
+                alignment: Alignment.centerRight,
+                offset: const Offset(5, 5),
+                child: Icon(
+                    size: 30,
+                    color: plugin.isBundledPlugin
+                        ? Theme.of(context).colorScheme.primary
+                        : Theme.of(context).colorScheme.tertiary,
+                    plugin.isBundledPlugin
+                        ? Icons.verified
+                        : Icons.extension)));
+  }
+
+  Widget buildPluginOptions(PluginInterface plugin) {
+    return FutureBuilder<Set<ProviderType>>(
+        future: PluginManager.getEnabledProviderTypesOf(plugin),
+        builder: (context, snapshot) {
+          // Don't show anything until the future is done
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const SizedBox();
+          }
+          final Set<ProviderType> provides = snapshot.data!;
+          return ThemedDialog(
+              title: "${plugin.prettyName} options",
+              primaryText: "应用",
+              onPrimary: Navigator.of(context).pop,
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  OptionsSwitch(
+                      title: "搜索结果来源",
+                      subTitle:
+                          "使用此插件提供视频搜索结果",
+                      switchState:
+                          provides.contains(ProviderType.searchResults),
+                      onToggled: (newState) => _setAsProvider(plugin, provides,
+                          ProviderType.searchResults, newState)),
+                  OptionsSwitch(
+                      title: "首页内容来源",
+                      subTitle: "在首页显示此插件提供的内容",
+                      switchState: provides.contains(ProviderType.homepage),
+                      onToggled: (newState) => _setAsProvider(
+                          plugin, provides, ProviderType.homepage, newState)),
+                  OptionsSwitch(
+                      title: "搜索建议来源",
+                      subTitle: "使用此插件提供搜索建议",
+                      switchState:
+                          provides.contains(ProviderType.searchSuggestions),
+                      onToggled: (newState) => _setAsProvider(plugin, provides,
+                          ProviderType.searchSuggestions, newState)),
+                  OptionsSwitch(
+                      title: "外部链接处理",
+                      subTitle:
+                          "使用此插件处理分享到应用或拖入应用的链接",
+                      switchState:
+                          provides.contains(ProviderType.externalLinkHandler),
+                      onToggled: (newState) => _setAsProvider(plugin, provides,
+                          ProviderType.externalLinkHandler, newState)),
+                  if (!plugin.isBundledPlugin)
+                    ListTile(
+                        trailing: const Icon(Icons.delete_forever,
+                            size: 40, color: Colors.red),
+                        contentPadding: EdgeInsets.only(left: 16, right: 8),
+                        title: const Text("删除第三方插件"),
+                        subtitle: Text(
+                            "永久删除此插件的文件及配置"),
+                        onTap: () async {
+                          await PluginManager.deletePlugin(plugin);
+                          _loadPluginLists();
+                          Navigator.of(context).pop();
+                        }),
+                ],
+              ));
+        });
+  }
+}

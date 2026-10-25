@@ -1,0 +1,386 @@
+name: Build release
+on:
+  workflow_dispatch:
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Preparing environment
+        run: |
+          mkdir ./release
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: 'oracle'
+          java-version: '21'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+
+      - name: Disable flutter/dart analytics
+        run: |
+          dart --disable-analytics
+          flutter config --disable-analytics
+
+      - name: Downloading keystores
+        uses: actions/checkout@v5
+        with:
+          repository: Hedon-Haven/keystores
+          path: ./android/keystores
+          token: ${{ secrets.READ_ACCESS }}
+          sparse-checkout: android
+
+      - name: Move keystores to correct dir
+        run: mv ./android/keystores/android/* ./android/keystores/
+
+      - name: Building android releases
+        run: |
+          echo "Preparing flutter"
+          flutter clean && flutter pub get
+          echo "Building split apks"
+          flutter -v build apk --split-per-abi
+          echo "Building combined apk"
+          flutter -v build apk
+          echo "Copying apks to release dir"
+          mv ./build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk ./release/android-arm32.apk
+          mv ./build/app/outputs/flutter-apk/app-arm64-v8a-release.apk ./release/android-arm64.apk
+          mv ./build/app/outputs/flutter-apk/app-x86_64-release.apk ./release/android-x86_64.apk
+          mv ./build/app/outputs/flutter-apk/app-release.apk ./release/android-all.apk
+
+      - name: Uploading android artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-artifacts
+          path: ./release/*.apk
+
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Preparing environment
+        run: |
+          mkdir ./release
+          rustup target add aarch64-apple-ios
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+
+      - name: Building unsigned iOS release
+        run: |
+          echo "Preparing flutter"
+          flutter clean && flutter pub get
+          echo "Building unsigned ios .app"
+          flutter build ios --no-codesign --release
+          
+          # zip and rename to make .ipa file
+          mkdir Payload
+          cp -r build/ios/iphoneos/Runner.app Payload/
+          zip -r "ios-arm64.ipa" Payload/
+
+          echo "Copying IPA to release dir"
+          cp "ios-arm64.ipa" ./release/
+
+      - name: Uploading iOS artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-artifacts
+          path: ./release/*.ipa
+
+  build-linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Preparing environment
+        run: |
+          mkdir ./release
+          sudo apt-get update -y
+          sudo apt-get install -y ninja-build libgtk-3-dev mpv libmpv-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+
+      - name: Building linux-x86_64 releases
+        run: |
+          echo "Preparing flutter"
+          flutter clean && flutter pub get
+          echo "Building linux-x64 release bundle"
+          flutter -v build linux --target-platform linux-x64
+          bash ./linux/fix-version-post-build.sh
+          echo "Compressing bundles"
+          tar -czvf linux-x86_64.tar.gz -C ./build/linux/x64/release/bundle .
+          echo "Copying bundles to release dir"
+          mv ./linux-x86_64.tar.gz ./release/linux-x86_64.tar.gz
+
+      - name: Uploading linux-x86_64 artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64-artifacts
+          path: ./release/*.tar.gz
+
+  build-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Preparing environment
+        run: |
+          mkdir ./release
+          sudo apt-get update -y
+          sudo apt-get install -y ninja-build libgtk-3-dev mpv libmpv-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: "master"
+
+      - name: Building linux-arm64 release
+        run: |
+          echo "Preparing flutter"
+          flutter clean && flutter pub get
+          echo "Building linux-arm64 release bundle"
+          flutter -v build linux --target-platform linux-arm64
+          bash ./linux/fix-version-post-build.sh
+          echo "Compressing linux-arm64 bundle..."
+          tar -czvf ./release/linux-arm64.tar.gz -C ./build/linux/arm64/release/bundle .
+
+      - name: Uploading linux-arm64 artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-arm64-artifacts
+          path: ./release/*.tar.gz
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Preparing environment
+        run: |
+          mkdir ./release
+          cargo install --git https://github.com/indygreg/apple-platform-rs --branch main --bin rcodesign apple-codesign
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+
+      - name: Downloading keystores
+        uses: actions/checkout@v5
+        with:
+          repository: Hedon-Haven/keystores
+          path: ./macos/keystores
+          token: ${{ secrets.READ_ACCESS }}
+          sparse-checkout: macos
+
+      - name: Move keystores to correct dir
+        run: mv ./macos/keystores/macos/* ./macos/keystores/
+
+      - name: Building macOS release
+        run: |
+          echo "Preparing flutter"
+          flutter clean && flutter pub get
+          echo "Building macos universal release"
+          flutter -v build macos --release
+          echo "Signing .app file"
+          rcodesign sign \
+            --pem-source macos/keystores/release.crt \
+            --pem-source macos/keystores/release.key \
+            "build/macos/Build/Products/Release/Hedon Haven.app"
+          echo "Packing into a .dmg"
+          hdiutil create \
+            -volname "Hedon Haven" \
+            -srcfolder "build/macos/Build/Products/Release/Hedon Haven.app" \
+            -ov -format UDZO \
+            "./release/macos-arm64.dmg"
+
+      - name: Uploading macOS artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-artifacts
+          path: release/*.dmg
+
+  build-windows-x86_64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+
+      - name: Preparing environment
+        run: |
+          mkdir release
+
+      - name: Building Windows release
+        run: |
+          echo "Preparing flutter"
+          flutter clean
+          flutter pub get
+          
+          # Replace fvp plugin symlink with junction (libarchive workaround)
+          $fvpDir = (Get-ChildItem "$env:LOCALAPPDATA\Pub\Cache\hosted\pub.dev" -Filter "fvp-*" | Select-Object -First 1).FullName
+          $link = "$env:GITHUB_WORKSPACE\windows\flutter\ephemeral\.plugin_symlinks\fvp"
+          Remove-Item -LiteralPath $link -Force -Recurse
+          cmd /c mklink /J "$link" "$fvpDir"
+          
+          echo "Building windows x64 release"
+          flutter -v build windows --release
+          
+          echo "Compressing release folder"
+          Compress-Archive -Path "build\windows\x64\runner\Release\*" `
+                           -DestinationPath "release\windows-x86_64.zip" `
+                           -Force
+
+      - name: Uploading windows-x86_64 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-x86_64-artifacts
+          path: release/*.zip
+
+  #  build-windows-arm64:
+  #    runs-on: windows-11-arm
+  #    steps:
+  #      - uses: actions/checkout@v5
+  #        with:
+  #          fetch-depth: 1
+  #
+  #      - name: Set up Flutter
+  #        uses: subosito/flutter-action@v2
+  #        with:
+  #          channel: "master"
+  #
+  #      - name: Preparing environment
+  #        run: |
+  #          mkdir release
+  #
+  #      - name: Building windows arm64 release
+  #        run: |
+  #          echo "Preparing flutter"
+  #          flutter clean
+  #          flutter pub get
+  #
+  #          echo "Building windows arm64 release"
+  #          flutter -v build windows --release
+  #
+  #          echo "Compressing release folder"
+  #          Compress-Archive -Path "build\windows\arm64\runner\Release\*" `
+  #                           -DestinationPath "release\windows-arm64.zip" `
+  #                           -Force
+  #
+  #      - name: Uploading windows-arm64 artifact
+  #        uses: actions/upload-artifact@v7
+  #        with:
+  #          name: windows-arm64-artifacts
+  #          path: release/*.zip
+
+  create-release:
+    runs-on: ubuntu-latest
+    needs: [ build-android, build-ios, build-linux-x86_64, build-linux-arm64, build-macos, build-windows-x86_64 ] #, build-windows-arm64 ]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download android artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: android-artifacts
+          path: ./release
+      - name: Download iOS artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ios-artifacts
+          path: ./release
+      - name: Download linux-x86_64 artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: linux-x86_64-artifacts
+          path: ./release
+      - name: Download linux-arm64 artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: linux-arm64-artifacts
+          path: ./release
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: macos-artifacts
+          path: ./release
+      - name: Download windows-x86_64 artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-x86_64-artifacts
+          path: ./release
+      #      - name: Download windows-arm64 artifacts
+      #        uses: actions/download-artifact@v8
+      #        with:
+      #          name: windows-arm64-artifacts
+      #          path: ./release
+
+
+      - name: Generating checksums.json
+        run: |
+          json="{}"
+          for file in ./release/*; do
+            checksum=$(sha256sum "$file" | awk '{ print $1 }')
+            # Get the filename without the path
+            filename=$(basename "$file")
+            json=$(echo "$json" | jq --arg file "$filename" --arg checksum "$checksum" '. + {($file): $checksum}')
+          done
+          echo "$json" > ./release/checksums.json
+      - name: Generating release tag
+        id: tag
+        run: |
+          tag=v$(grep -oP '(?<=version: )[^+]*' ./pubspec.yaml)
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+      - name: Generating commit body
+        id: commit-body
+        run: |
+          # Force refresh git tags
+          git tag -d $(git tag -l)
+          git fetch --tags
+          PREV_TAG=$(git tag --sort=-creatordate | head -1)
+          NEW_TAG="${{ steps.tag.outputs.tag }}"
+          FULL_URL="https://github.com/Hedon-Haven/Hedon-Haven/compare/${PREV_TAG}...${NEW_TAG}"
+          COMMITS=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          echo "UNSTABLE BUILD! Do not download!"
+          echo ""
+          echo ""
+          echo "All commits since $PREV_TAG"
+          echo $COMMITS
+          echo ""
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          printf '%s\n' "${COMMITS}" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo "**Full Changelog**: ${FULL_URL}" >> $GITHUB_OUTPUT
+          echo ""
+          echo ""
+          echo "UNSTABLE BUILD! Do not download!"
+          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Publishing new release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: UNSTABLE APK BUILD - ${{ steps.tag.outputs.tag }}
+          body: ${{ steps.commit-body.outputs.body }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          make_latest: false
+          prerelease: true
+          files: |
+            ./release/*

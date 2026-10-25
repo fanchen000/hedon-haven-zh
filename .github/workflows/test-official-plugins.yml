@@ -1,0 +1,121 @@
+name: Test bundled plugins
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *' # Every day at midnight UTC
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Preparing environment
+        run: |
+          sudo apt-get update -y 
+          sudo apt-get install -y libglib2.0-dev libgtk-3-dev
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+
+      - name: Disable flutter/dart analytics
+        run: |
+          dart --disable-analytics
+          flutter config --disable-analytics
+
+      - name: Get all bundled plugins
+        id: generate-matrix
+        run: |
+          # generate mocks
+          flutter pub get
+          flutter pub run build_runner build
+          # Run the flutter-test script
+          ALL_PLUGINS=$(flutter test --no-pub --reporter silent test/utils/print_all_bundled_plugins.dart)
+          echo "All plugins: $ALL_PLUGINS"
+          echo "matrix=$ALL_PLUGINS" >> "$GITHUB_OUTPUT"
+
+  run-jobs:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      # don't cancel other tests if one fails
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJSON(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+
+      - name: Disable flutter/dart analytics
+        run: |
+          dart --disable-analytics
+          flutter config --disable-analytics
+
+      - name: Connect to www.vpngate.net via openVPN
+        run: |
+          sudo apt-get update && sudo apt-get install -y openvpn
+          
+          REAL_IP=$(curl ifconfig.me)
+          echo "Real IP: $REAL_IP"
+          
+          SERVER_IDS=(187 197 233)
+          for ID in "${SERVER_IDS[@]}"; do
+            echo "Trying VPN server $ID"
+            sudo openvpn --daemon --log /dev/stdout --data-ciphers AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC:CHACHA20-POLY1305 --config ".github/vpn_configs/vpngate_openvpn_$ID.ovpn"
+            echo "Waiting for VPN to connect for 60 seconds"
+            sleep 60
+          
+            CURRENT_IP=$(curl ifconfig.me)
+            if [ "$REAL_IP" != "$CURRENT_IP" ]; then
+              echo "Connected to server $ID"
+              break
+            fi
+          
+            echo "Failed to connect to server $ID, killing daemon and trying next server..."
+            sudo pkill openvpn || true
+            sleep 5
+          done
+          
+          NEW_IP=$(curl ifconfig.me)
+          echo "New IP: $NEW_IP"
+          if [ "$REAL_IP" == "$NEW_IP" ]; then
+            echo "Couldn't connect to any VPN server!"
+            exit 1
+          fi
+
+      - name: Testing ${{ matrix.plugin }}
+        run: |
+          flutter pub get
+          flutter pub run build_runner build
+          # build native libs
+          sudo apt-get update && sudo apt-get install libgtk-3-dev
+          flutter build linux
+          # add native libs to LD_LIBRARY_PATH
+          export LD_LIBRARY_PATH="$(pwd)/build/linux/x64/release/bundle/lib:$(pwd)/build/linux/x64/release/plugins/flutter_js/bundle/lib:${LD_LIBRARY_PATH}"
+          
+          PLUGIN=${{ matrix.plugin }} flutter test --no-pub test/bundled_plugins_test.dart
+
+      # Disconnect before uploading dumps
+      - name: Disconnect from openVPN
+        run: sudo killall openvpn
+
+      - name: Upload dumps
+        # This ensures the dumps are uploaded even if the testing step will cause the job itself to fail
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.plugin }}_dumps
+          path: dumps/

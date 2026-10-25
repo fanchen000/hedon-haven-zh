@@ -1,0 +1,38 @@
+name: Update release changelogs
+on:
+  workflow_dispatch:
+  release:
+    types:
+      - published
+      - edited
+jobs:
+  run-on-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v5
+
+      - name: Updating release-stable.json
+        run: |
+          # Fetch the latest release data from the GitHub API
+          RELEASE_DATA=$(curl -s "https://api.github.com/repos/Hedon-Haven/Hedon-Haven/releases/latest")
+            
+          # Extract "tag_name" and "body" fields
+          VERSION=$(echo "$RELEASE_DATA" | jq -r '.tag_name')
+          CHANGELOG=$(echo "$RELEASE_DATA" | jq -r '.body')
+          
+          # Create changelog
+          echo "$CHANGELOG" > release-changelogs/$VERSION
+          
+          # link latest to it
+          cd release-changelogs
+          rm latest
+          ln -s $VERSION latest
+
+      # Commit and push changes
+      - name: Committing changes to repo
+        uses: EndBug/add-and-commit@v9
+        with:
+          message: "Update latest changelog"
+          default_author: github_actions
+          push: origin HEAD:main

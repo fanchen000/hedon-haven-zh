@@ -1,0 +1,189 @@
+import 'package:material_ui/material_ui.dart';
+
+import '/services/bug_report_manager.dart';
+import '/services/loading_handler.dart';
+import '/services/plugin_manager.dart';
+import '/ui/screens/bug_report/bug_reports_list.dart';
+import '/ui/screens/search.dart';
+import '/ui/screens/video_list.dart';
+import '/utils/global_vars.dart';
+import '/utils/universal_formats.dart';
+import 'filters/filters.dart';
+
+class ResultsScreen extends StatefulWidget {
+  Future<List<UniversalVideoPreview>?> videoResults;
+  final LoadingHandler loadingHandler;
+  UniversalSearchRequest searchRequest;
+  bool openedFromExternalLink;
+
+  ResultsScreen(
+      {super.key,
+      required this.videoResults,
+      required this.searchRequest,
+      required this.loadingHandler,
+      bool? openedFromExternalLink})
+      : openedFromExternalLink = openedFromExternalLink ?? false;
+
+  @override
+  State<ResultsScreen> createState() => _ResultsScreenState();
+}
+
+class _ResultsScreenState extends State<ResultsScreen> {
+  Key videoListKey = UniqueKey();
+  bool isLoading = true;
+  bool noPluginsEnabled = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.videoResults.whenComplete(() {
+      logger.d("ResultsIssues Map: ${widget.loadingHandler.resultsBugReports}");
+      // Update the scraping report button
+      setState(() => isLoading = false);
+    });
+
+    PluginManager.getProviders(ProviderType.searchResults).then((value) {
+      if (value.isEmpty) {
+        setState(() => noPluginsEnabled = true);
+      }
+    });
+  }
+
+  Future<List<UniversalVideoPreview>?> loadMoreResults() async {
+    setState(() => isLoading = true);
+    logger.i("Loading additional results");
+    var results = widget.loadingHandler
+        .getSearchResults(widget.searchRequest, await widget.videoResults);
+    // Updates the scraping report button
+    setState(() => isLoading = false);
+    return results;
+  }
+
+  void popAllScreens() {
+    if (!widget.openedFromExternalLink) {
+      // Silently remove SearchScreen from the stack (no animation)
+      Navigator.of(context).removeRouteBelow(ModalRoute.of(context)!);
+    }
+    // Pop ResultsScreen with a single reverse animation directly to home
+    Navigator.of(context).pop();
+  }
+
+  void createResultsBugReport() async {
+    List<BugReport> reportedBugs = await Navigator.push(
+      context,
+      MaterialPageRoute(
+        settings: RouteSettings(name: "/bug-reports-list-scraping-mode"),
+        builder: (context) => BugReportsListScreen(
+            scrapingReportMode: true,
+            bugReportsList: widget.loadingHandler.resultsBugReports),
+      ),
+    );
+
+    // Remove all reported bugs
+    widget.loadingHandler.resultsBugReports
+        .removeWhere((uvp) => reportedBugs.contains(uvp));
+
+    setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+        canPop: widget.openedFromExternalLink,
+        onPopInvoked: (goingToPop) {
+          if (!goingToPop) {
+            popAllScreens();
+          }
+        },
+        child: Scaffold(
+            appBar: AppBar(
+              automaticallyImplyLeading: false,
+              titleSpacing: 0,
+              title: Padding(
+                  padding: const EdgeInsets.only(left: 15, bottom: 6, top: 1),
+                  child: GestureDetector(
+                    onTap: () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          settings: RouteSettings(name: "/search_screen"),
+                          builder: (context) => SearchScreen(
+                              previousSearch: widget.searchRequest),
+                        )),
+                    child: Material(
+                      borderRadius: const BorderRadius.horizontal(
+                          left: Radius.circular(25),
+                          right: Radius.circular(25)),
+                      color: Theme.of(context).colorScheme.surfaceVariant,
+                      child: Row(children: [
+                        IconButton(
+                            icon: const Icon(Icons.arrow_back),
+                            onPressed: () => popAllScreens()),
+                        Expanded(
+                          child: Padding(
+                            padding: const EdgeInsets.only(right: 15),
+                            child: Text(
+                              widget.searchRequest.searchString,
+                              overflow: TextOverflow.clip,
+                              textAlign: TextAlign.left,
+                              style: const TextStyle(fontSize: 16),
+                            ),
+                          ),
+                        ),
+                      ]),
+                    ),
+                  )),
+              actions: [
+                if (widget.loadingHandler.resultsBugReports.isNotEmpty &&
+                    !isLoading)
+                  IconButton(
+                      icon: Icon(
+                          color: Theme.of(context).colorScheme.error,
+                          Icons.error_outline),
+                      onPressed: () => createResultsBugReport()),
+                IconButton(
+                  color: Theme.of(context).colorScheme.primary,
+                  icon: const Icon(Icons.filter_alt),
+                  onPressed: () {
+                    Navigator.of(context)
+                        .push(MaterialPageRoute(
+                            settings: RouteSettings(name: "/search_filter"),
+                            builder: (context) => FilterScreen(
+                                searchRequest: widget.searchRequest)))
+                        .then((value) {
+                      if (value != null) {
+                        logger.i("Getting new results with new filters");
+                        widget.searchRequest = value;
+                        widget.videoResults = widget.loadingHandler
+                            .getSearchResults(widget.searchRequest);
+                        // Force rebuild of VideoList by changing the key and forcing flutter to create a new VideoList
+                        setState(() => videoListKey = UniqueKey());
+                      } else {
+                        logger
+                            .i("Filters not changed, not getting new results");
+                      }
+                    });
+                  },
+                ),
+              ],
+            ),
+            body: CustomScrollView(slivers: [
+              VideoList(
+                  scrollController: ScrollController(),
+                  // This key is needed to completely rebuild the VideoList widget
+                  key: videoListKey,
+                  videoList: widget.videoResults,
+                  searchRequest: widget.searchRequest,
+                  reloadInitialResults: () => widget.loadingHandler
+                      .getSearchResults(widget.searchRequest),
+                  loadMoreResults: loadMoreResults,
+                  noResultsMessage: "没有找到结果",
+                  noResultsErrorMessage: "加载搜索结果失败",
+                  showScrapingReportButton: true,
+                  bugReports: widget.loadingHandler.resultsBugReports,
+                  ignoreInternetError: false,
+                  noPluginsEnabled: noPluginsEnabled,
+                  noPluginsMessage:
+                      "尚未启用搜索结果来源，请至少在一个插件中启用此功能")
+            ])));
+  }
+}

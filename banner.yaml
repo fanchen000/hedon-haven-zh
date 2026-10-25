@@ -1,0 +1,21 @@
+# Contains information needed to display the banner inside the app. Accessed via banner.hedon-haven.top
+severity: "normal"  # can be "normal" or "important"
+title: "Disclaimer"
+message: |-
+  The app is still under heavy development. Bugs, errors and crashes might occur.
+
+# Overrides for specific versions
+overrides:
+  "0.6.7":
+    severity: "normal"
+    title: "Please don't use unstable versions!"
+    message: |-
+      If you downloaded this app version from the unstable release, please re-install it. 
+      The experimental build included a literal crash button on the home screen. In the future 
+      please only use the in-app updater.
+  # technically this one doesn't work since banners were added in v0.6.7
+  "0.6.5":
+    severity: "normal"
+    title: "New Banner feature"
+    message: |-
+      Banner feature added. Pulls banner messages from remote server on app startup.

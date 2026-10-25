@@ -1,0 +1,60 @@
+name: Hedon Haven zh-CN iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [zh-cn-v067]
+    paths:
+      - 'lib/**'
+      - 'ios/**'
+      - 'tools/**'
+      - '.github/workflows/ios-zh.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  ios-zh:
+    runs-on: macos-15
+    timeout-minutes: 70
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Validate translated source
+        run: |
+          python3 -c "import json; d=json.load(open('tools/zh_CN.json',encoding='utf-8')); assert len(d)==279"
+          grep -q '首页' lib/main.dart
+          grep -q '隐私' lib/ui/screens/settings/settings_main.dart
+          grep -q '搜索' lib/ui/screens/search.dart
+          git diff --check
+      - name: Dependencies
+        run: |
+          flutter config --no-analytics
+          flutter pub get
+          flutter analyze --no-fatal-infos
+      - name: Build unsigned iOS app
+        run: flutter build ios --release --no-codesign
+      - name: Pack IPA and inspect
+        run: |
+          test -d build/ios/iphoneos/Runner.app
+          mkdir -p Payload
+          ditto build/ios/iphoneos/Runner.app Payload/Runner.app
+          /usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' Payload/Runner.app/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Payload/Runner.app/Info.plist
+          zip -qr Hedon-Haven-zh-CN-v0.6.7-unsigned.ipa Payload
+          shasum -a 256 Hedon-Haven-zh-CN-v0.6.7-unsigned.ipa | tee IPA_SHA256.txt
+          unzip -t Hedon-Haven-zh-CN-v0.6.7-unsigned.ipa | tail -2
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: hedon-haven-zh-cn-v067-unsigned-ipa
+          path: |
+            Hedon-Haven-zh-CN-v0.6.7-unsigned.ipa
+            IPA_SHA256.txt
+            tools/translation-report.json
+          retention-days: 30
